@@ -15,13 +15,11 @@
 
 | 宿主机变量 | 容器内路径 | 用途 |
 | --- | --- | --- |
-| `HOST_PATCHED_REPOS` | `/opt/dsv4-patched` | 已有五个仓库的 Git 副本，只读挂载 |
 | `HOST_INPUT_ROOT` | `/inputs` | 原始裁剪权重和数据，只读挂载 |
 | `HOST_WORK_ROOT` | `/workspace/dsv4-mxfp4` | 本地 NVMe 上的源码、缓存、日志和 checkpoint |
 
 ```bash
 export BASE_IMAGE=quay.io/ascend/vllm-ascend:nightly-releases-v0.30.0-a5
-export HOST_PATCHED_REPOS=/abs/path/moe_mxfp4_long_run_baseline
 export HOST_INPUT_ROOT=/abs/path/dsv4-inputs
 export HOST_WORK_ROOT=/abs/local-nvme/dsv4-mxfp4
 
@@ -40,7 +38,6 @@ docker run -it --name dsv4-mxfp4-env \
   --mount type=bind,src=/usr/local/dcmi,dst=/usr/local/dcmi,readonly \
   --mount type=bind,src=/etc/ascend_install.info,dst=/etc/ascend_install.info,readonly \
   --mount "type=bind,src=$(command -v npu-smi),dst=/usr/local/bin/npu-smi,readonly" \
-  --mount "type=bind,src=$HOST_PATCHED_REPOS,dst=/opt/dsv4-patched,readonly" \
   --mount "type=bind,src=$HOST_INPUT_ROOT,dst=/inputs,readonly" \
   --mount "type=bind,src=$HOST_WORK_ROOT,dst=/workspace/dsv4-mxfp4" \
   --workdir /workspace/dsv4-mxfp4 --entrypoint /bin/bash "$BASE_IMAGE"
@@ -63,15 +60,15 @@ docker run -it --name dsv4-mxfp4-env \
 
 ## 2. 拉取源码并检出指定版本
 
-`SOURCE_ROOT` 是容器内新的源码根目录。将已有的五仓 Git 副本挂载或复制到容器，再将 `PATCHED_REPO_ROOT` 指向包含这五个仓库的目录。分支推送到私仓后，可将前五条命令中的来源路径换成各自的私仓 SSH 地址。
+`SOURCE_ROOT` 是容器内新的源码根目录。五个修改仓的 `dsv4-top16-moe-mxfp4` 分支均发布后，使用下方 HTTPS 地址获取固定提交。
 
 | 仓库 | 来源 | 训推对齐提交 |
 | --- | --- | --- |
-| `verl` | `dsv4-top16-moe-mxfp4`，包含训练入口 | `81261489` |
-| `MindSpeed-Bridge` | `dsv4-top16-moe-mxfp4` | `5cd84eef` |
-| `Megatron-LM` | `dsv4-top16-moe-mxfp4` | `add3dcf1` |
-| `Megatron-Bridge` | `dsv4-top16-moe-mxfp4` | `219ee113` |
-| `vllm-ascend` | `dsv4-top16-moe-mxfp4` | `5514c452` |
+| `verl` | [Sususue/verl](https://github.com/Sususue/verl)，包含训练入口 | `81261489` |
+| `MindSpeed-Bridge` | [qq_44739108/MindSpeed-Bridge](https://gitcode.com/qq_44739108/MindSpeed-Bridge) | `5cd84eef` |
+| `Megatron-LM` | [Sususue/Megatron-LM](https://github.com/Sususue/Megatron-LM) | `add3dcf1` |
+| `Megatron-Bridge` | [Sususue/Megatron-Bridge](https://github.com/Sususue/Megatron-Bridge) | `219ee113` |
+| `vllm-ascend` | [Sususue/vllm-ascend](https://github.com/Sususue/vllm-ascend) | `5514c452` |
 | `vllm` | vLLM 上游 | `ced6857a` |
 | `MegatronAdaptor` | Ascend 上游 | `04951c8b` |
 | `MindSpeed` | Ascend 上游 | `bafa47af` |
@@ -82,7 +79,6 @@ docker run -it --name dsv4-mxfp4-env \
 
 ```bash
 export SOURCE_ROOT=/workspace/dsv4-mxfp4/sources
-export PATCHED_REPO_ROOT=/opt/dsv4-patched
 
 bash <<'BASH'
 set -euo pipefail
@@ -101,11 +97,11 @@ checkout_at() {
     git -C "$repo" checkout --detach "$commit"
 }
 
-checkout_at verl "$PATCHED_REPO_ROOT/verl" 812614890654630da022cbbd6ea3ae769482e27f
-checkout_at MindSpeed-Bridge "$PATCHED_REPO_ROOT/MindSpeed-Bridge" 5cd84eef2e39c39254723677d30a6a6dee0ba206
-checkout_at Megatron-LM "$PATCHED_REPO_ROOT/Megatron-LM" add3dcf1f348d66280a861bd475e7f2648dd21f9
-checkout_at Megatron-Bridge "$PATCHED_REPO_ROOT/Megatron-Bridge" 219ee113ac7cd6b714d71805ee3e74d5a74fcaa3
-checkout_at vllm-ascend "$PATCHED_REPO_ROOT/vllm-ascend" 5514c452e70ac05071656f6717071e56b024c873
+checkout_at verl https://github.com/Sususue/verl.git 812614890654630da022cbbd6ea3ae769482e27f
+checkout_at MindSpeed-Bridge https://gitcode.com/qq_44739108/MindSpeed-Bridge.git 5cd84eef2e39c39254723677d30a6a6dee0ba206
+checkout_at Megatron-LM https://github.com/Sususue/Megatron-LM.git add3dcf1f348d66280a861bd475e7f2648dd21f9
+checkout_at Megatron-Bridge https://github.com/Sususue/Megatron-Bridge.git 219ee113ac7cd6b714d71805ee3e74d5a74fcaa3
+checkout_at vllm-ascend https://github.com/Sususue/vllm-ascend.git 5514c452e70ac05071656f6717071e56b024c873
 
 checkout_at vllm https://github.com/vllm-project/vllm.git ced6857afa0ea7b2e3f0846a62e1394e90f15607
 checkout_at MegatronAdaptor https://gitcode.com/ascend/MegatronAdaptor.git 04951c8b8919efda9b9465017d2e0eaad6d344e0
