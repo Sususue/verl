@@ -877,9 +877,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             self._load_megatron_fsdp_checkpoint(local_path, del_local_after_load=del_local_after_load)
             return
 
-        model_dist_path = get_model_dist_checkpoint_path(local_path)
-        optim_dist_path = get_optimizer_dist_checkpoint_path(local_path)
-        extra_dist_path = get_extra_dist_checkpoint_path(local_path)
+        model_dist_path = get_model_dist_checkpoint_path(local_path, create=False)
+        optim_dist_path = get_optimizer_dist_checkpoint_path(local_path, create=False)
+        extra_dist_path = get_extra_dist_checkpoint_path(local_path, create=False)
 
         self._raise_for_unsupported_peft_checkpoint_layout(local_path, model_dist_path)
 
@@ -904,6 +904,16 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         ):
             model_sharded_state_dict = self._build_model_sharded_state_dict(metadata)
 
+        # A cold HybridDeviceOptimizer may initialize state with a dummy optimizer
+        # step. Its rank-local writeback must finish before HF model values are restored.
+        hybrid_restore = []
+        if self.should_load_hf_model and self.peft_cls is None and self.should_load_optimizer:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+            for outer in getattr(self.optimizer, "chained_optimizers", [self.optimizer]):
+                inner = getattr(outer, "optimizer", None)
+                if isinstance(inner, HybridDeviceOptimizer):
+                    hybrid_restore.append(inner)
+
         # ── Load model weights ──────────────────────────────────────────────
         if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
             model_sd = self._maybe_filter_peft_state_dict(dict(model_sharded_state_dict))
@@ -927,8 +937,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             else:
                 log_with_rank(f"Loaded sharded model checkpoint from {model_dist_path}", rank=self.rank, logger=logger)
 
-        elif self.should_load_hf_model and self.peft_cls is None:
-            hf_model_path = get_hf_model_checkpoint_path(local_path)
+        elif self.should_load_hf_model and self.peft_cls is None and not hybrid_restore:
+            hf_model_path = get_hf_model_checkpoint_path(local_path, create=False)
             self._load_model_as_hf_via_bridge(hf_model_path)
             log_with_rank(f"Loaded HF model checkpoint from {hf_model_path} with bridge", rank=self.rank, logger=logger)
 
@@ -943,7 +953,15 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 f"Optimizer state dict not found in {loaded_optim.keys()}. "
                 f"Please check the checkpoint file {optim_dist_path}."
             )
-            self.optimizer.load_state_dict(loaded_optim["optimizer"])
+            if hybrid_restore:
+                from verl.utils.checkpoint.hybrid_step24 import saved_hybrid_steps, restore_hybrid_steps, audit_loaded_moments
+                saved_steps = saved_hybrid_steps(self.optimizer, loaded_optim["optimizer"], hybrid_restore)
+                with audit_loaded_moments(self.optimizer, True, self.rank):
+                    self.optimizer.load_state_dict(loaded_optim["optimizer"])
+            else:
+                self.optimizer.load_state_dict(loaded_optim["optimizer"])
+            if hybrid_restore:
+                restore_hybrid_steps(saved_steps, self.rank)
             log_with_rank(f"Loaded optimizer checkpoint from {optim_dist_path}", rank=self.rank, logger=logger)
             if self.use_checkpoint_opt_param_scheduler:
                 assert "lr_scheduler" in loaded_optim, (
@@ -955,6 +973,23 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     log_with_rank(
                         f"Loaded LR scheduler checkpoint from {optim_dist_path}", rank=self.rank, logger=logger
                     )
+
+        if hybrid_restore:
+            hf_model_path = get_hf_model_checkpoint_path(local_path, create=False)
+            self._load_model_as_hf_via_bridge(hf_model_path)
+            # A BF16 CPU optimizer copy carries the high bits of its parameter.
+            # Keep restored FP32 masters and optimizer moments/remainders intact.
+            with torch.no_grad():
+                for inner in hybrid_restore:
+                    copied = 0
+                    for device_param, cpu_param in inner.gpu_params_map_cpu_copy.items():
+                        if device_param in inner.param_to_fp32_param:
+                            continue
+                        if cpu_param.dtype != device_param.dtype:
+                            raise RuntimeError("Hybrid optimizer parameter mirror dtype mismatch")
+                        cpu_param.copy_(device_param.detach())
+                        copied += 1
+                    print(f"CP80_RESTORE_AFTER_OPT rank={self.rank} mirrored={copied}", flush=True)
 
         # ── Load RNG states ─────────────────────────────────────────────────
         if self.should_load_extra:

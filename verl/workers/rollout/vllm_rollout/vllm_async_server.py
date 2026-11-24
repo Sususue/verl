@@ -645,6 +645,10 @@ class vLLMHttpServer:
             sampling_params["flat_logprobs"] = True
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+        if os.environ.get("DSV4_B24_EXACT_FROM_POLICY") is not None:
+            from verl.utils.debug.dsv4_b24_request_timing import apply_length_schedule
+
+            apply_length_schedule(sampling_params, self.global_steps)
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
@@ -663,6 +667,8 @@ class vLLMHttpServer:
         if not sampling_params.get("stop") and not sampling_params.get("bad_words"):
             sampling_params.setdefault("detokenize", False)
 
+        if os.environ.get("DSV4_ALIGN_PURE_ROLLOUT") == "1" and sampling_params.get("logprobs") is None:
+            sampling_params["logprobs"] = 0
         self._preprocess_sampling_params(sampling_params)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         validate_topk_logprob_request(sampling_params)
@@ -710,7 +716,11 @@ class vLLMHttpServer:
                 request_id=request_id,
                 lora_request=lora_request,
                 priority=priority,
-                data_parallel_rank=self._dp_rank_for_session(session_id),
+                data_parallel_rank=(
+                    int(priority) % self.config.data_parallel_size
+                    if os.environ.get("DSV4_GSM8K_RUN_DIR")
+                    else self._dp_rank_for_session(session_id)
+                ),
             )
 
             # Get final response
@@ -726,6 +736,15 @@ class vLLMHttpServer:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
+
+        if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+            from verl.utils.debug.dsv4_gsm8k_audit import record_native
+
+            record_native(final_res, sampling_params, self.replica_rank, priority)
+        if os.environ.get("DSV4_B24_AUDIT_DIR"):
+            from verl.utils.debug.dsv4_b24_request_timing import record_request_timing
+
+            record_request_timing(final_res, self.global_steps, self.replica_rank, sampling_params=sampling_params)
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
@@ -787,6 +806,21 @@ class vLLMHttpServer:
         elif sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
+        if os.environ.get("DSV4_ALIGN_PURE_ROLLOUT") == "1":
+            import json as _json
+            from pathlib import Path as _Path
+            folder = _Path(os.environ["DSV4_QAT_RUN"]) / "samples"
+            record = {"request": request_id, "prompt_ids": list(prompt_ids), "response_ids": list(token_ids),
+                      "chosen_logprobs": log_probs, "finish_reason": final_res.outputs[0].finish_reason,
+                      "temperature": sampling_params.temperature, "max_tokens": sampling_params.max_tokens}
+            with (folder / f"pure_rollout_{os.getpid()}.jsonl").open("a") as _out:
+                _out.write(_json.dumps(record) + "\n")
+        if os.environ.get("DSV4_ALIGN_ROLLOUT_SELF") == "1":
+            from verl.utils.debug.rollout_self28 import capture
+            rank = (int(priority) % self.config.data_parallel_size if os.environ.get("DSV4_GSM8K_RUN_DIR")
+                    else self._dp_rank_for_session(session_id))
+            await capture(self, request_id, prompt_ids, token_ids, log_probs, sampling_params,
+                          lora_request, priority, rank)
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts

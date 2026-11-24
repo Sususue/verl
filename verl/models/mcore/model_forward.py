@@ -307,11 +307,23 @@ def gptmodel_forward_model_engine(
         else:
             attention_mask = attention_mask_bshd
 
+        # [CONSISTENCY-FIX 2026-11-10 verl-swap-263653e7] DSV4 hash 路由(前 num_hash_layers
+        # 层)按 token id 查 tid2eid 静态表, 依赖 thread-local input_ids
+        # (stash_input_ids)。verl forward 不经 mindspeed step(那里才 stash),
+        # 缺失时 hash 层静默退化为评分路由, 与 vllm rollout 查表路由分歧。
+        if not vision_model:
+            from mindspeed_bridge.models.deepseek_v4_flash.modelling_deepseek_v4_flash.router import (
+                stash_input_ids,
+            )
+
+            stash_input_ids(input_ids_bshd)
+
         output_orig = model(
             input_ids=input_ids_bshd,
-            attention_mask=attention_mask,
             position_ids=None if vision_model else position_ids_bshd,
-            **model_kwargs,
+            **model_kwargs,            # [CONSISTENCY-FIX 2026-11-10 verl-swap-263653e7] DSV4-Flash CSA 隐式因果 SBHD;
+            attention_mask=None,
+
         )
         if post_process and logits_processor is not None:
             args = {

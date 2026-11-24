@@ -1051,6 +1051,11 @@ class PPOTrainer(ABC):
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
+            if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+                batch_dict["uid"] = np.array(
+                    [f"gsm8k-train-{int(i):05d}" for i in batch_dict["index"]], dtype=object
+                )
+                batch_dict["priority"] = np.asarray(batch_dict["index"], dtype=np.int64)
             batch_size = len(batch_dict["uid"])
             batch_data_sources = batch_dict.get("data_source", ["unknown"] * batch_size)
             batch_rollout_ns = batch_dict.get(
@@ -1115,6 +1120,10 @@ class PPOTrainer(ABC):
 
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+            if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+                from verl.utils.debug.dsv4_gsm8k_audit import record_validation_batch
+
+                record_validation_batch(final_keys, data)
 
             sample_uids.extend(data.pop("uid").tolist())
             sample_outputs.extend(all_outputs[i] for i in final_indices)
@@ -1640,6 +1649,12 @@ class PPOTrainer(ABC):
         #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        if os.getenv("DSV4_ALIGN_SAME_TOKEN_QUALIFY") == "1":
+            from verl.utils.debug.qualify_fixed_tokens import run
+            run(self,batch)
+        assert not bypass_recomputing_logprobs
+        from verl.utils.debug.train_alignment import configure_training
+        self.actor_rollout_wg.execute_all_sync("actor_rollout_execute_with_func_generator",configure_training,self.global_steps)
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
             data = tq.kv_batch_get(
                 keys=batch.keys, partition_id=batch.partition_id, select_fields=["rollout_log_probs"]
@@ -1647,6 +1662,14 @@ class PPOTrainer(ABC):
             data["old_log_probs"] = data.pop("rollout_log_probs")
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return batch
+
+        if os.environ.get("DSV4_ALIGN_SNAPSHOT") or os.environ.get("DSV4_ALIGN_REPLAY"):
+            from verl.utils.debug.dsv4_alignment_replay import prepare_replay
+
+            batch = prepare_replay(batch, self.global_steps)
+            if os.environ.get("DSV4_ALIGN_VARIANTS") == "1":
+                from verl.utils.debug.dsv4_alignment_variants import compare_variants
+                compare_variants(self, batch)
 
         # 1. compute log probs
         batch.extra_info.update(
@@ -1662,6 +1685,8 @@ class PPOTrainer(ABC):
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+            if os.environ.get("DSV4_B24_AUDIT_DIR"):
+                fields.append("prompts")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue
@@ -1690,6 +1715,12 @@ class PPOTrainer(ABC):
         # 4. calculate rollout vs actor logprobs diff
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             metrics.update(calculate_debug_metrics(data))
+            if os.environ.get("DSV4_B24_AUDIT_DIR"):
+                from verl.utils.debug.dsv4_b24_audit import audit_batch
+
+                audit_batch(data, metrics, self.global_steps)
+                if os.environ.get("DSV4_ALIGN_DIAGNOSTIC_ONLY") == "1":
+                    raise RuntimeError("Alignment diagnostic completed before optimizer")
 
         return batch
 
@@ -1867,6 +1898,10 @@ class PPOTrainer(ABC):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
+        if os.environ.get("DSV4_B24_EXACT_FROM_POLICY") is not None:
+            from verl.utils.debug.dsv4_b24_audit import audit_optimizer_update
+
+            audit_optimizer_update(metrics, self.global_steps)
 
         return batch
 

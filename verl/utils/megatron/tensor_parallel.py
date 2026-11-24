@@ -207,6 +207,10 @@ def vocab_parallel_log_probs_from_logits(logits, labels):
     """TODO(zhangchi.usc1992): We may change the implementation later"""
     from megatron.core import tensor_parallel
 
+    # [CONSISTENCY-FIX 2026-11-10 verl-swap-263653e7] CE 归一化精度对齐 vllm 侧(fp32
+    # log_softmax): bf16 logits 直接进 CE 时内部 softmax/logsumexp 归约带 bf16 误差。
+    if logits.dtype != torch.float32:
+        logits = logits.float()
     return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
 
 

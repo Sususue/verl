@@ -226,6 +226,15 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        description = None
+        if self.config.quantization == "ascend" and not kwargs.get("peft_config"):
+            from verl.utils.vllm.dsv4_wire_quant import encode, rollout_description, spec
+            description = rollout_description(self.config, self.model_config)
+        if description is not None:
+            targets, wire_spec = spec(description)
+            kwargs["dsv4_quant_wire"] = {**wire_spec, "step": global_steps}
+            weights = encode(weights, targets, global_steps)
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,

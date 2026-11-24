@@ -207,6 +207,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
         """
+        if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+            from verl.utils.debug.dsv4_gsm8k_audit import strict_determinism
+
+            strict_determinism("actor_worker_before_engine_initialize", seed=1234)
         self.engine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):

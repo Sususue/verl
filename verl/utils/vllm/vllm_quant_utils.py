@@ -279,6 +279,10 @@ def apply_mxfp8_transformation_after_loading(model):
         return
 
     for name, module in model.named_modules():
+        # DSV4 FLOAT routers use a derived FP32 copy in the fused routing path.
+        # Refresh it after refit; otherwise it still contains dummy weights.
+        if isinstance(module, LinearBase) and getattr(module, "precast_fp32_weight", False):
+            module.quant_method.process_weights_after_loading(module)
         if (isinstance(module, LinearBase) or _is_expert_weight_module(module)) and (
             hasattr(module, "_mxfp8_original_shapes") or hasattr(module, "_mxfp4_original_shapes")
         ):
@@ -344,6 +348,16 @@ def _classify_quant_weight(name, model, is_ascend_mx):
 
 
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
+    # [W4A8-MXFP 2026-11-11] Ascend DSV4 在线量化分派 (PLAN 5.3):
+    # 仅量化路由专家 BF16 -> W4A8_MXFP; 其余参数原样透传。
+    # 先于原生 DSV4 已量化分支; 非 DSV4/非 Ascend MX 走原有逻辑。
+    if is_deepseek_v4_model(model) and is_vllm_ascend_mx_quant(quant_config):
+        from verl.utils.vllm.ascend_dsv4_quant import iter_ascend_dsv4_expert_weights
+        yield from iter_ascend_dsv4_expert_weights(
+            weights, quant_config.quant_description
+        )
+        return
+
     """Quantize weights to FP8 format using a memory-efficient generator.
 
 
@@ -436,7 +450,7 @@ def process_quanted_weights_after_loading(model, reload_state):
     refresh_rocm_attention_weight_caches(model)
 
 
-def load_quanted_weights(weights, model_runner, is_drafter=False):
+def load_quanted_weights(weights, model_runner, is_drafter=False, *, prequantized=False):
     if is_drafter:
         drafter = getattr(model_runner, "drafter", None)
         model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
@@ -450,7 +464,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     weights = list(weights)
-    weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
+    weights_quantized = weights if prequantized else quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader

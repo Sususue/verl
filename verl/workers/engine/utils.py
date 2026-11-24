@@ -57,6 +57,10 @@ def enable_full_determinism(seed: int):
     device_manual_seed(seed)
     device_manual_seed_all(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
+    if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+        from verl.utils.debug.dsv4_gsm8k_audit import strict_determinism
+
+        strict_determinism("engine_or_server", seed=seed)
     # Enable CUDNN deterministic mode
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False

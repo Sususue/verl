@@ -23,6 +23,9 @@ import torch.distributed
 from megatron.core import parallel_state as mpu
 from megatron.core.package_info import __version__
 from megatron.core.pipeline_parallel import get_forward_backward_func
+
+from verl.utils.debug.dsv4_b24_engine_timing import engine_timed
+from verl.utils.debug.dsv4_qat_audit import audit_phase, audit_engine_init
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
@@ -367,10 +370,27 @@ class MegatronEngine(BaseEngine):
         # Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
         # Megatron-Bridge <  v0.5.0 does not, so we fall back to manual setattr + finalize.
         if hasattr(provider, "apply_overrides_and_finalize"):
-            provider.apply_overrides_and_finalize(
-                dtype=self.param_dtype,
-                overrides=provider_overrides,
-            )
+            if os.environ.get("DSV4_B24_PROCESS_CACHE") == "1":
+                # This opt-in task uses a fresh cache per interpreter. Bridge's
+                # stale-lock cleanup recursively deletes even active builds;
+                # NFS retains open files as .nfs entries, making rmtree fail.
+                cache_dir = os.environ.get("TORCH_EXTENSIONS_DIR", "").rstrip("/")
+                if cache_dir.rsplit("/", 1)[-1] != str(os.getpid()):
+                    raise RuntimeError("DSV4_B24_PROCESS_CACHE requires a per-process extension cache")
+                from mindspeed_bridge.features.adaptor import FeatureAdaptor
+
+                original_cleanup = FeatureAdaptor.delete_lock_file
+                FeatureAdaptor.delete_lock_file = staticmethod(lambda: None)
+                try:
+                    provider.apply_overrides_and_finalize(dtype=self.param_dtype, overrides=provider_overrides)
+                finally:
+                    FeatureAdaptor.delete_lock_file = staticmethod(original_cleanup)
+                print("B24 provider finalized without deleting active isolated extension cache", flush=True)
+            else:
+                provider.apply_overrides_and_finalize(
+                    dtype=self.param_dtype,
+                    overrides=provider_overrides,
+                )
         else:
             provider.params_dtype = self.param_dtype
             provider.fp16 = self.param_dtype == torch.float16
@@ -448,6 +468,40 @@ class MegatronEngine(BaseEngine):
         )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
+
+        # [CONSISTENCY-FIX 2026-11-10 verl-swap-263653e7] lm_head fp32 matmul(实例级 patch):
+        # bf16 lm_head 量化格点差是训推 logprob 残差来源之一; 本侧 fp32 化
+        # (训练 loss 与 logprob 同时受益, 数学等价精度更高)。
+        import torch.nn.functional as _F
+
+        for _chunk in module:
+            _m = _chunk
+            for _ in range(4):  # 解 DDP -> Float16Module -> GPTModel
+                if hasattr(_m, "output_layer"):
+                    break
+                _m = getattr(_m, "module", None)
+                if _m is None:
+                    break
+            _ol = getattr(_m, "output_layer", None)
+            if _ol is None or getattr(_ol, "_verl_fp32_lmhead", False):
+                continue
+
+            def _fp32_lmhead(hidden_states, weight=None, *a, _ol=_ol, **kw):
+                _w = (weight if weight is not None else _ol.weight).float()
+                tail_mode = os.getenv("DSV4_TAIL_COMPARISON", "")
+                if tail_mode in ("head_tile", "head_all", "head_all_repeat"):
+                    shape = hidden_states.shape
+                    rows = hidden_states.reshape(-1, shape[-1]).float()
+                    chunks = []
+                    for tile in rows.split(64):
+                        size = len(tile)
+                        padded = _F.pad(tile, (0, 0, 0, 64 - size))
+                        chunks.append(_F.linear(padded.contiguous(), _w)[:size])
+                    return torch.cat(chunks).reshape(*shape[:-1], _w.shape[0]), None
+                return _F.linear(hidden_states.float(), _w), None
+
+            _ol.forward = _fp32_lmhead
+            _ol._verl_fp32_lmhead = True
 
         if self.engine_config.use_dist_checkpointing:
             load_mcore_dist_weights(
@@ -527,6 +581,7 @@ class MegatronEngine(BaseEngine):
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
 
         self.module = self._build_megatron_module()
+        audit_engine_init(self)
 
         if self._qat_enabled and not self.engine_config.forward_only:
             from verl.utils.modelopt import apply_qat_to_modules
@@ -634,6 +689,8 @@ class MegatronEngine(BaseEngine):
             # if use distributed optimizer, zero grad buffer will be handled by optimizer
             chunk.zero_grad_buffer()
 
+    @audit_phase('optimizer')
+    @engine_timed('optimizer_step')
     def optimizer_step(self):
         """
         Perform an optimization step to update model parameters based on accumulated gradients.
@@ -643,11 +700,28 @@ class MegatronEngine(BaseEngine):
         """
         # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
         # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
-        if getattr(self, "_distillation_use_topk_active", False):
-            get_torch_device().empty_cache()
+        task_release_cache = (
+            os.environ.get("DSV4_B24_RELEASE_CACHE_BEFORE_FIRST_OPT") == "1"
+            and not getattr(self, "_b24_first_optimizer_completed", False)
+        )
+        if getattr(self, "_distillation_use_topk_active", False) or task_release_cache:
+            device = get_torch_device()
+            if task_release_cache:
+                before_allocated = device.memory_allocated()
+                before_reserved = device.memory_reserved()
+            device.empty_cache()
+            if task_release_cache:
+                print(
+                    f"B24_OPT_CACHE_RELEASE pid={os.getpid()} "
+                    f"allocated_before={before_allocated} reserved_before={before_reserved} "
+                    f"allocated_after={device.memory_allocated()} reserved_after={device.memory_reserved()}",
+                    flush=True,
+                )
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
         if update_successful:
+            if os.environ.get("DSV4_B24_RELEASE_CACHE_BEFORE_FIRST_OPT") == "1":
+                self._b24_first_optimizer_completed = True
             # allgather already execute in optimizer.step in new megatron
             pass
         else:
@@ -667,6 +741,7 @@ class MegatronEngine(BaseEngine):
         self.lr_scheduler.step(1)
         return get_megatron_last_lr(self.optimizer)
 
+    @engine_timed('to')
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
         Move model parameters, optimizer states, or both to the specified device.
@@ -779,6 +854,8 @@ class MegatronEngine(BaseEngine):
             return input_ids.offsets()[-1]
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
+    @audit_phase('forward_backward')
+    @engine_timed('forward_backward_batch')
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
         self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
@@ -1006,6 +1083,42 @@ class MegatronEngine(BaseEngine):
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
 
+        # [CONSISTENCY-FIX 2026-11-10 verl-swap-263653e7] 同步流补发 router.expert_bias:
+        # bridge.export_hf_weights 不导出该 buffer, rollout 引擎的
+        # gate.e_score_correction_bias(torch.empty)拿不到 checkpoint gate.bias,
+        # 两侧 noaux_tc 路由选择分歧。名字 model.layers.N.mlp.gate.bias 由 vllm
+        # load_weights 自动改名(e_score_correction_bias)。值取训练态当前值。
+
+        def _with_router_bias(src):
+            for _name, _tensor in src:
+                yield _name, _tensor
+            _chunks = self.module if isinstance(self.module, (list, tuple)) else [self.module]
+            for _chunk in _chunks:
+                _m = _chunk
+                for _ in range(4):  # 解 DDP -> Float16Module -> GPTModel
+                    if hasattr(_m, "decoder"):
+                        break
+                    _m = getattr(_m, "module", None)
+                    if _m is None:
+                        break
+                _layers = getattr(getattr(_m, "decoder", None), "layers", None)
+                if _layers is None:
+                    continue
+                for _idx, _layer in enumerate(_layers):
+                    _router = getattr(getattr(_layer, "mlp", None), "router", None)
+                    _rb = getattr(_router, "expert_bias", None)
+                    if _rb is None:
+                        continue
+                    yield f"model.layers.{_idx}.mlp.gate.bias", _rb.detach().to(torch.float32)
+
+        per_tensor_param = _with_router_bias(per_tensor_param)
+        if self.engine_config.forward_only and getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v4":
+            # The source checkpoint is authoritative in pure inference. Keep its FP32
+            # mHC/scalar values rather than the BF16-rounded Megatron master copy.
+            from verl.utils.megatron.dsv4_source_precision import iter_dsv4_fp32_source_weights
+
+            per_tensor_param = iter_dsv4_fp32_source_weights(per_tensor_param, self.model_config.local_path)
+
         return per_tensor_param, peft_config
 
     def _mcore_export_index(self):
@@ -1178,7 +1291,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if distillation_use_topk:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
         if not distillation_only:
-            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
+            if os.getenv("DSV4_TAIL_COMPARISON") in ("head_sampler", "head_all", "head_all_repeat"):
+                from megatron.core import parallel_state
+                assert parallel_state.get_tensor_model_parallel_world_size() == 1
+                assert logits_bak.size(-1) == 129280 and bool(((label >= 0) & (label < logits_bak.size(-1))).all())
+                rows = logits_bak.reshape(-1, logits_bak.size(-1))
+                labels = label.reshape(-1).long()
+                chosen = []
+                for start in range(0, len(rows), 64):
+                    scores = rows[start:start+64].log_softmax(dim=-1, dtype=torch.float32)
+                    chosen.append(scores.gather(1, labels[start:start+64,None]).squeeze(1))
+                ret["log_probs"] = torch.cat(chosen).reshape_as(label)
+            else:
+                ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
 

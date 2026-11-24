@@ -213,6 +213,10 @@ class vLLMColocateWorkerExtension:
                 if k not in os.environ:
                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
 
+        if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+            from verl.utils.debug.dsv4_gsm8k_audit import setup_process
+
+            setup_process()
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
@@ -258,7 +262,40 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, dsv4_quant_wire=None):
+        """Refit under the worker's actual vLLM config, including Ascend post-load ops."""
+        from vllm.config import set_current_vllm_config
+
+        if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+            from verl.utils.debug.dsv4_gsm8k_audit import strict_determinism
+
+            strict_determinism("rollout_before_real_refit", seed=self.model_runner.vllm_config.model_config.seed)
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            audit_checkpoint = os.environ.get("DSV4_ALIGN_CHECKPOINT_AUDIT") == "1" and not hasattr(self, "_alignment_receipts")
+            if audit_checkpoint:
+                from verl.utils.debug import evening_weight_audit_1117
+                self._alignment_receipts = set()
+                initial_inventory = evening_weight_audit_1117.inventory(self.model_runner.model)
+            result = self._update_weights_from_ipc_with_config(
+                peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm, dsv4_quant_wire=dsv4_quant_wire
+            )
+            if os.environ.get("DSV4_GSM8K_RUN_DIR"):
+                from verl.utils.debug.dsv4_gsm8k_audit import audit_loaded_model
+
+                audit_loaded_model(self)
+            if os.environ.get("DSV4_B24_AUDIT_DIR"):
+                if os.environ.get("DSV4_QAT_RUN") and self.model_runner.vllm_config.quant_config is not None:
+                    from verl.utils.debug.dsv4_qat_audit import audit_refit
+                else:
+                    from verl.utils.debug.dsv4_b24_refit_audit import audit_refit
+                audit_refit(self)
+            if audit_checkpoint:
+                evening_weight_audit_1117.after(self, initial_inventory, self._alignment_receipts)
+            return result
+
+    def _update_weights_from_ipc_with_config(
+        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False, dsv4_quant_wire=None
+    ):
         """Update the weights of the rollout model."""
         if self.device is None:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
@@ -306,6 +343,28 @@ class vLLMColocateWorkerExtension:
             for model in self._iter_all_models():
                 staged_moe_layers.extend(stage_unquantized_moe_params(model))
 
+        # Audit complete routed-expert streams across IPC buckets, without retaining tensors.
+        from verl.utils.vllm.vllm_quant_utils import is_vllm_ascend_mx_quant
+        from verl.utils.vllm.vllm_fp4_utils import is_deepseek_v4_model
+
+        audit_dsv4 = is_deepseek_v4_model(self.model_runner.model) and is_vllm_ascend_mx_quant(
+            self.model_runner.vllm_config.quant_config
+        )
+        wire_audit = None
+        if dsv4_quant_wire is not None:
+            from verl.utils.vllm.dsv4_wire_quant import PayloadAudit, spec
+            if not audit_dsv4:
+                raise ValueError("Packed DSV4 payload for incompatible rollout model")
+            description = self.model_runner.vllm_config.quant_config.quant_description
+            targets, expected_spec = spec(description)
+            if any(dsv4_quant_wire.get(k) != v for k, v in expected_spec.items()):
+                raise ValueError("Sender and rollout quantization descriptors differ")
+            wire_audit = PayloadAudit(targets)
+        elif audit_dsv4 and not peft_config:
+            raise ValueError("DSV4 W4A8 rollout requires sender-side quantized expert payloads")
+        seen_experts = set()
+        seen_hash_tables = set()
+
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
@@ -318,6 +377,19 @@ class vLLMColocateWorkerExtension:
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            if audit_dsv4:
+                from verl.utils.vllm.ascend_dsv4_quant import canonical_expert_name
+
+                for name, tensor in weights:
+                    if wire_audit is not None:
+                        wire_audit.observe(name,tensor)
+                    if name.endswith(".gate.tid2eid"):
+                        seen_hash_tables.add(name)
+                    canonical = canonical_expert_name(name)
+                    if canonical is not None:
+                        if canonical in seen_experts:
+                            raise ValueError(f"Duplicate expert in refit stream: {canonical}")
+                        seen_experts.add(canonical)
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
                 lora_weights.update((name, tensor.clone()) for name, tensor in weights)
@@ -332,11 +404,49 @@ class vLLMColocateWorkerExtension:
                 return
             self._update_weights(
                 weights,
+                wire_prequantized=wire_audit is not None,
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
             )
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
+        if wire_audit is not None:
+            wire_audit.finish("receiver_before_vllm_postload",dsv4_quant_wire["step"])
+
+        if audit_dsv4:
+            import json
+            from pathlib import Path
+            from safetensors import safe_open
+
+            # Optional diagnostic: compare small logical weight samples before layout conversion.
+            audit_source = os.environ.get("DSV4_AUDIT_SOURCE_MODEL")
+            if audit_source:
+                source = Path(audit_source)
+                source_map = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
+                parameters = dict(self.model_runner.model.named_parameters())
+                comparisons = []
+                for layer_id in (0, 3):
+                    pairs = [(f"layers.{layer_id}.attn.{proj}.weight", f"model.layers.{layer_id}.self_attn.{proj}.weight") for proj in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b")]
+                    pairs += [(f"layers.{layer_id}.{key}", f"model.layers.{layer_id}.{key}") for key in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale")]
+                    pairs += [(f"layers.{layer_id}.ffn.gate.weight", f"model.layers.{layer_id}.mlp.gate.weight")]
+                    if layer_id == 0:
+                        pairs += [("layers.0.ffn.gate.tid2eid", "model.layers.0.mlp.gate.tid2eid")]
+                    else:
+                        pairs += [("layers.3.ffn.gate.bias", "model.layers.3.mlp.gate.e_score_correction_bias")]
+                    for source_name, runtime_name in pairs:
+                        actual = parameters.get(runtime_name)
+                        if source_name not in source_map or actual is None:
+                            comparisons.append({"source": source_name, "runtime": runtime_name, "missing": True})
+                            continue
+                        with safe_open(str(source / source_map[source_name]), framework="pt") as handle:
+                            expected = handle.get_tensor(source_name)
+                        if tuple(actual.shape) == tuple(expected.shape):
+                            actual_sample = actual.detach().reshape(-1)[:256].cpu()
+                            expected_sample = expected.reshape(-1)[:256].to(actual_sample.dtype)
+                            comparisons.append({"source": source_name, "shape": list(actual.shape), "equal": bool(torch.equal(actual_sample, expected_sample)), "max_abs_diff": float((actual_sample.to(torch.float32) - expected_sample.to(torch.float32)).abs().max())})
+                        else:
+                            comparisons.append({"source": source_name, "runtime_shape": list(actual.shape), "source_shape": list(expected.shape)})
+                logger.info("DSV4_WEIGHT_SAMPLES %s", json.dumps({"rank": self.local_rank, "comparisons": comparisons}))
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
@@ -364,6 +474,43 @@ class vLLMColocateWorkerExtension:
                 for model, model_config in self._iter_all_models_with_config():
                     process_weights_after_loading(model, model_config, self.device)
 
+        if audit_dsv4:
+            import json
+
+            model = self.model_runner.model
+            holders = [m for m in model.modules() if hasattr(m, "_mxfp4_original_shapes")]
+            expected = 3 * sum(m._mxfp4_original_shapes["w13_weight"][0] for m in holders)
+            from verl.utils.vllm.ascend_dsv4_quant import build_expert_targets
+
+            global_targets = build_expert_targets(self.model_runner.vllm_config.quant_config.quant_description)
+            local_targets = set()
+            for layer_idx, layer in enumerate(model.model.layers):
+                mlp = layer.mlp
+                for expert in range(mlp.physical_expert_start, mlp.physical_expert_start + mlp.n_local_physical_experts):
+                    for projection in ("gate_proj", "up_proj", "down_proj"):
+                        local_targets.add(f"model.layers.{layer_idx}.mlp.experts.{expert}.{projection}.weight")
+            if seen_experts not in (global_targets, local_targets):
+                raise ValueError(f"Incomplete expert refit stream: {len(seen_experts)} matrices")
+            if len(local_targets) != expected:
+                raise ValueError(f"Local expert allocation mismatch: {len(local_targets)} != {expected}")
+            stale_routers = [i for i, layer in enumerate(model.model.layers) if hasattr(layer.mlp.gate, "weight_fp32") and not torch.equal(layer.mlp.gate.weight_fp32, layer.mlp.gate.weight.float())]
+            if stale_routers:
+                raise ValueError(f"Stale FP32 router caches after refit: {stale_routers}")
+            head_dtype = str(model.lm_head.weight.dtype)
+            if getattr(model.config, "head_dtype", None) == "float32" and head_dtype != "torch.float32":
+                raise ValueError(f"FP32 head changed dtype: {head_dtype}")
+            logger.info("DSV4_REFIT_AUDIT %s", json.dumps({
+                "local_rank": self.local_rank,
+                "expert_matrices_received": len(seen_experts),
+                "local_expert_matrices": expected,
+                "stream_scope": "global" if seen_experts == global_targets else "local",
+                "quantized_moe_layers": len(holders),
+                "head_dtype": head_dtype,
+                "hash_tables_received": sorted(seen_hash_tables),
+                "hash_first_rows": [layer.mlp.gate.tid2eid[0].tolist() for layer in model.model.layers if getattr(layer.mlp.gate, "tid2eid", None) is not None],
+                "schemes": sorted({type(m.quant_method.quant_method).__name__ for m in holders}),
+            }, sort_keys=True))
+
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
 
@@ -381,6 +528,7 @@ class vLLMColocateWorkerExtension:
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
+        wire_prequantized: bool = False,
     ):
         if peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
@@ -403,10 +551,12 @@ class vLLMColocateWorkerExtension:
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
                 model_updates = drop_tied_alias_updates(self.model_runner.model, param_updates)
-                loaded_params = load_quanted_weights(model_updates, self.model_runner) if model_updates else []
+                loaded_params = load_quanted_weights(model_updates, self.model_runner, prequantized=wire_prequantized) if model_updates else []
+                if hasattr(self, "_alignment_receipts"):
+                    self._alignment_receipts.update(loaded_params)
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync() and model_updates:
-                    load_quanted_weights(model_updates, self.model_runner, is_drafter=True)
+                    load_quanted_weights(model_updates, self.model_runner, is_drafter=True, prequantized=wire_prequantized)
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"

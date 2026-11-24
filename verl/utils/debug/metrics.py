@@ -111,11 +111,18 @@ def calculate_debug_metrics(data: DataProto) -> dict:
         }
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
+    rollout_logprobs_diff = calculate_log_prob_diff(
+        actor_old_log_probs.float(), rollout_old_log_probs.float(), response_mask_bool
+    )
+    logprobs_mismatch = torch.masked_select(actor_old_log_probs != rollout_old_log_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
+        "training/rollout_logprobs_mismatch_count": int(logprobs_mismatch.sum().item()),
+        "training/rollout_logprobs_diff_max": torch.max(rollout_logprobs_diff).detach().item(),
+        "training/rollout_logprobs_diff_mean": torch.mean(rollout_logprobs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
     }

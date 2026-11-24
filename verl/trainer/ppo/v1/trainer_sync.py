@@ -29,8 +29,15 @@ class PPOTrainerSync(PPOTrainer):
     """
 
     def on_init_end(self):
-        # update weights after loading checkpoint
-        self.checkpoint_manager.update_weights(self.global_steps)
+        # Default behavior is unchanged; val-only can exercise an actual second refit.
+        repeats = int(self.config.trainer.get("validation_initial_refits", 1))
+        if repeats not in (1, 2) or (repeats != 1 and not self.config.trainer.get("val_only", False)):
+            raise ValueError("validation_initial_refits=2 is supported only for val_only validation")
+        for index in range(repeats):
+            if index:
+                self.checkpoint_manager.sleep_replicas()
+            self.checkpoint_manager.update_weights(self.global_steps)
+            logger.info("Initial weight refit %s/%s completed", index + 1, repeats)
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):

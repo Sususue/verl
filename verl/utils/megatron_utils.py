@@ -804,28 +804,31 @@ def get_extra_checkpoint_path(checkpoint_path):
     return p
 
 
-def get_model_dist_checkpoint_path(checkpoint_path):
+def get_model_dist_checkpoint_path(checkpoint_path, *, create=True):
     """``model/dist_ckpt/`` — Megatron model or PEFT adapter shards."""
-    p = os.path.join(get_model_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
-    local_mkdir_safe(p)
+    p = os.path.join(checkpoint_path, _MODEL_SUBDIR, _DIST_CKPT_SUBDIR)
+    if create:
+        local_mkdir_safe(p)
     return p
 
 
-def get_optimizer_dist_checkpoint_path(checkpoint_path):
+def get_optimizer_dist_checkpoint_path(checkpoint_path, *, create=True):
     """``optimizer/dist_ckpt/`` — optimizer + lr_scheduler dist_checkpointing directory."""
-    p = os.path.join(get_optimizer_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
-    local_mkdir_safe(p)
+    p = os.path.join(checkpoint_path, _OPTIMIZER_SUBDIR, _DIST_CKPT_SUBDIR)
+    if create:
+        local_mkdir_safe(p)
     return p
 
 
-def get_extra_dist_checkpoint_path(checkpoint_path):
+def get_extra_dist_checkpoint_path(checkpoint_path, *, create=True):
     """``extra/dist_ckpt/`` — rng_state dist_checkpointing directory."""
-    p = os.path.join(get_extra_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
-    local_mkdir_safe(p)
+    p = os.path.join(checkpoint_path, _EXTRA_SUBDIR, _DIST_CKPT_SUBDIR)
+    if create:
+        local_mkdir_safe(p)
     return p
 
 
-def get_hf_model_checkpoint_path(checkpoint_path):
+def get_hf_model_checkpoint_path(checkpoint_path, *, create=True):
     """``model/huggingface/`` — HuggingFace-format weights, config, and tokenizer.
 
     Historically this lived at ``<checkpoint>/huggingface``; as of layout
@@ -833,8 +836,9 @@ def get_hf_model_checkpoint_path(checkpoint_path):
     :py:func:`verl.utils.checkpoint.megatron_checkpoint_manager.MegatronCheckpointManager._raise_for_old_layout`
     for old-layout detection.
     """
-    p = os.path.join(get_model_checkpoint_path(checkpoint_path), _HUGGINGFACE_SUBDIR)
-    local_mkdir_safe(p)
+    p = os.path.join(checkpoint_path, _MODEL_SUBDIR, _HUGGINGFACE_SUBDIR)
+    if create:
+        local_mkdir_safe(p)
     return p
 
 

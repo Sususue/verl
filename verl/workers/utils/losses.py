@@ -105,6 +105,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
+    from verl.utils.debug.train_alignment import record_loss_scores
+    record_loss_scores(log_prob,old_log_prob,response_mask)
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 
