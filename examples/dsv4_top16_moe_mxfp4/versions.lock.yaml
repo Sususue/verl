@@ -23,6 +23,7 @@ patched_repositories:
   verl:
     upstream: https://github.com/verl-project/verl.git
     base: 263653e749306287a5032140cce3d7833c1959d0
+    recipe_commit: 812614890654630da022cbbd6ea3ae769482e27f
     runtime_code_commit: e279851da1cc906b6927112c02d10795a01f3049
   MindSpeed-Bridge:
     upstream: https://gitcode.com/Ascend/MindSpeed-Bridge.git
