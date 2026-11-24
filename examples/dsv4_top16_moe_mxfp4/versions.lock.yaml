@@ -1,0 +1,58 @@
+branch: dsv4-top16-moe-mxfp4
+environment:
+  base_image: quay.io/ascend/vllm-ascend:nightly-releases-v0.30.0-a5
+  base_image_arm64_manifest: "sha256:0a5fc83adac01be0a9d240c91ffa2cfa711bdd437a2272e31c360fc5fcd58f18"
+  reference_image_id: "sha256:26e089982066cfc49d92cd982f591e33a39ff381c9576c5485b942ae9c1d1928"
+  platform: linux/arm64
+  reference_distribution: openEuler 24.03 LTS-SP4
+  accelerator: Ascend 950DT
+  reference_driver: "26.2.0.b020"
+  cann: "9.2.1"
+  python: "3.12.16"
+  packages:
+    torch: "2.10.0+cpu"
+    torch_npu: "2.10.0.post7"
+    ray: "2.48.0"
+    hydra-core: "1.3.8"
+    omegaconf: "2.3.1"
+    transformers: "5.14.1"
+    triton: "3.6.0"
+    triton_ascend: "3.6.0.post2"
+    batch_invariant_ops: "1.0.0"
+patched_repositories:
+  verl:
+    upstream: https://github.com/verl-project/verl.git
+    base: 263653e749306287a5032140cce3d7833c1959d0
+    runtime_code_commit: e279851da1cc906b6927112c02d10795a01f3049
+  MindSpeed-Bridge:
+    upstream: https://gitcode.com/Ascend/MindSpeed-Bridge.git
+    base: 2588ee2ddf8939bea896c71ca184ef7d1d6b5e24
+    commit: 5cd84eef2e39c39254723677d30a6a6dee0ba206
+  Megatron-LM:
+    upstream: https://github.com/NVIDIA/Megatron-LM.git
+    base: ba7b5ebce12af60627a80985792a1449ce45f46c
+    commit: add3dcf1f348d66280a861bd475e7f2648dd21f9
+  Megatron-Bridge:
+    upstream: https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+    base: fcbb6031103d0ca845c1a54d4fee55ecfcca17b6
+    commit: 219ee113ac7cd6b714d71805ee3e74d5a74fcaa3
+  vllm-ascend:
+    upstream: https://github.com/vllm-project/vllm-ascend.git
+    base: 3509a6d152181c450daab24bfa91588205cabd54
+    commit: 5514c452e70ac05071656f6717071e56b024c873
+pinned_repositories:
+  vllm:
+    upstream: https://github.com/vllm-project/vllm.git
+    commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+  MegatronAdaptor:
+    upstream: https://gitcode.com/ascend/MegatronAdaptor.git
+    commit: 04951c8b8919efda9b9465017d2e0eaad6d344e0
+  MindSpeed:
+    upstream: https://gitcode.com/ascend/MindSpeed.git
+    commit: bafa47afb8bdfa89bcdfb12b91461def43f6c391
+  MindSpeed-Ops:
+    upstream: https://gitcode.com/ascend/MindSpeed-Ops.git
+    commit: e0d16d2891f35f1504104fbe9e94b1a1a536b2ba
+  TransformerEngineNPU:
+    upstream: https://gitcode.com/ascend/TransformerEngineNPU.git
+    commit: 1ac83362fb48cb55efb2bf0cf4bcbe299f79ce0a

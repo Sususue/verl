@@ -67,7 +67,9 @@ def audit_engine_init(engine):
     assert os.environ.get('QAT_SCHEME', '') == expected
     assert 'DSA_SCHEME' not in os.environ, 'DSA_SCHEME must remain unset in this task'
     repo_root = Path(__file__).resolve().parents[3]
-    assert Path(mindspeed_bridge.__file__).resolve().is_relative_to('/mnt/share/s00956100/dsv4_mxfp4_new/MindSpeed-Bridge')
+    bridge_root = os.environ.get("DSV4_MINDSPEED_BRIDGE_ROOT")
+    if bridge_root:
+        assert Path(mindspeed_bridge.__file__).resolve().is_relative_to(Path(bridge_root).resolve())
     assert Path(verl.__file__).resolve().is_relative_to(repo_root)
     if os.environ.get("DSV4_ALIGN_LAYER_DUMP") == "1":
         from verl.utils.debug.dsv4_alignment_layer_dump import install_layer_dump
